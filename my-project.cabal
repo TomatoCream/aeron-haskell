@@ -1,0 +1,74 @@
+cabal-version: 3.0
+name:          my-project
+version:       0.1.0.0
+synopsis:      A Haskell project with Nix
+license:       MIT
+build-type:    Simple
+
+common common-options
+  default-language:   GHC2021
+  ghc-options:
+    -Wall -Wcompat -Wincomplete-record-updates
+    -Wincomplete-uni-patterns -Wredundant-constraints -Wunused-packages
+
+  default-extensions:
+    BangPatterns
+    ConstraintKinds
+    DataKinds
+    DeriveAnyClass
+    DeriveDataTypeable
+    DeriveFoldable
+    DeriveFunctor
+    DeriveGeneric
+    DeriveLift
+    DeriveTraversable
+    DerivingStrategies
+    EmptyCase
+    ExistentialQuantification
+    ExplicitForAll
+    FlexibleContexts
+    FlexibleInstances
+    GADTs
+    GeneralisedNewtypeDeriving
+    InstanceSigs
+    KindSignatures
+    MultiParamTypeClasses
+    NamedFieldPuns
+    OverloadedStrings
+    PatternSynonyms
+    PolyKinds
+    RankNTypes
+    ScopedTypeVariables
+    StandaloneDeriving
+    StandaloneKindSignatures
+    TupleSections
+    TypeApplications
+    TypeFamilies
+    TypeOperators
+
+library
+  import:          common-options
+  hs-source-dirs:  src
+  exposed-modules: MyLib
+  build-depends:   base >=4.17 && <5
+
+executable my-project
+  import:         common-options
+  hs-source-dirs: app
+  main-is:        Main.hs
+
+  -- Warp and any other threaded server needs this: on the non-threaded RTS the
+  -- timer manager is unavailable and the server accepts no connections.
+  ghc-options:    -threaded -rtsopts -with-rtsopts=-N
+  build-depends:
+    , base        >=4.17 && <5
+    , my-project
+
+test-suite my-project-test
+  import:         common-options
+  type:           exitcode-stdio-1.0
+  hs-source-dirs: test
+  main-is:        Main.hs
+  build-depends:
+    , base        >=4.17 && <5
+    , my-project

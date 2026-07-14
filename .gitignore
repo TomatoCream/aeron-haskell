@@ -1,0 +1,17 @@
+dist-newstyle/
+.stack-work/
+result
+result-*
+.direnv/
+*.o
+*.hi
+*.hie
+*.chi
+*.chs.h
+*.dyn_o
+*.dyn_hi
+*.prof
+*.aux
+*.hp
+*.eventlog
+cabal.project.local

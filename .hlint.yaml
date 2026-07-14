@@ -1,0 +1,6 @@
+# HLint configuration
+# https://github.com/ndmitchell/hlint
+- arguments: [-XQuasiQuotes, -XPatternSynonyms]
+- ignore: {name: "Use lambda-case"}
+- ignore: {name: "Use if"}
+- ignore: {name: "Redundant bracket"}

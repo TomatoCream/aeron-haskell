@@ -1,0 +1,44 @@
+# Indentation & Spacing
+indentation: 2
+column-limit: 100
+record-brace-space: true
+newlines-between-decls: 1
+indent-wheres: false
+
+# Arrows & Commas
+function-arrows: trailing
+comma-style: leading
+
+# Import/Export Styling
+import-export-style: diff-friendly
+import-grouping: preserve
+
+# Documentation
+haddock-style: multi-line
+haddock-style-module: multi-line
+
+# Record Style
+record-style: aligned
+
+# Code Structure
+let-style: auto
+in-style: right-align
+if-style: indented
+
+# Parentheses & Constraints
+single-constraint-parens: auto
+single-deriving-parens: auto
+sort-constraints: false
+sort-derived-classes: false
+sort-deriving-clauses: false
+
+# Operators & Syntax
+trailing-section-operators: false
+unicode: detect
+
+# Behavior
+respectful: false
+
+# Configuration Data
+fixities: []
+reexports: []
