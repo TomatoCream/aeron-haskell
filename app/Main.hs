@@ -13,7 +13,7 @@ main = do
   withAeron defaultConfig {aeronDir = dir} $ \client ->
     withPublication client "aeron:ipc" 1001 $ \pub ->
       withSubscription client "aeron:ipc" 1001 $ \sub -> do
-        awaitConnected 5 (publicationIsConnected pub)
+        awaitConnected client 5 (publicationIsConnected pub)
 
         result <- offerByteString pub "hello from haskell"
         unless (isPublicationError result)

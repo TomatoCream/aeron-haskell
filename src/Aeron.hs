@@ -17,13 +17,21 @@ module Aeron (
   -- * Client
   Client,
   AeronConfig (..),
+  ConductorMode (..),
   defaultConfig,
   withAeron,
+
+  -- ** Driving the conductor
+  -- $invoker
+  doWork,
+  idleStrategy,
 
   -- * Publications
   Publication,
   withPublication,
   publicationIsConnected,
+  publicationConstants,
+  PublicationConstants (..),
 
   -- ** Sending
   PublicationResult (..),
@@ -40,14 +48,26 @@ module Aeron (
 
   -- * Subscriptions
   Subscription,
+  SubscriptionOpts (..),
+  defaultSubscriptionOpts,
   withSubscription,
+  withSubscriptionOpts,
   subscriptionIsConnected,
+  subscriptionImageCount,
+  subscriptionConstants,
+  SubscriptionConstants (..),
+
+  -- * Images
+  Image,
+  imageConstants,
+  ImageConstants (..),
 
   -- ** Receiving
   Fragment (..),
   fragmentByteString,
   Poller,
   withPoller,
+  withAssemblingPoller,
   pollFragments,
 
   -- * Waiting
@@ -58,9 +78,20 @@ import Aeron.Error (checkNeg, throwAeron)
 import Aeron.FFI.Raw
 import Aeron.FFI.Types (
   BufferClaim (..),
+  ErrorHandlerC,
   FragmentHandlerC,
+  ImageConstants (..),
+  ImageHandlerC,
+  PublicationConstants (..),
   PublicationResult (..),
+  SubscriptionConstants (..),
+  imageConstantsSize,
   isPublicationError,
+  peekImageConstants,
+  peekPublicationConstants,
+  peekSubscriptionConstants,
+  publicationConstantsSize,
+  subscriptionConstantsSize,
   pattern AdminAction,
   pattern BackPressured,
   pattern Closed,
@@ -77,16 +108,32 @@ import Data.ByteString qualified as BS
 import Data.ByteString.Unsafe qualified as BSU
 import Data.Int (Int32)
 import Data.Word (Word8)
-import Foreign.C.String (withCString)
+import Foreign.C.String (peekCString, withCString)
 import Foreign.C.Types (CBool (..), CInt)
-import Foreign.Marshal.Alloc (alloca)
-import Foreign.Ptr (FunPtr, Ptr, castPtr, freeHaskellFunPtr, nullPtr)
+import Foreign.Marshal.Alloc (alloca, allocaBytes)
+import Foreign.Ptr (FunPtr, Ptr, castPtr, freeHaskellFunPtr, nullFunPtr, nullPtr)
 import Foreign.Storable (peek)
 import GHC.Clock (getMonotonicTime)
 
 -- Client -------------------------------------------------------------------
 
-newtype Client = Client (Ptr T.Aeron)
+-- | Who runs the client conductor's duty cycle.
+data ConductorMode
+  = -- | Aeron spawns and owns a conductor thread. Simple, and the default.
+    ConductorThread
+  | {- | You own the duty cycle and must call 'doWork' regularly.
+
+    This is the mode to want under a latency budget: no Aeron-owned thread
+    wakes up on a core you have pinned, and the callbacks fire on your thread
+    rather than on a C-spawned one. It costs you the obligation to pump.
+    -}
+    AgentInvoker
+  deriving stock (Eq, Show)
+
+data Client = Client
+  { clientPtr :: !(Ptr T.Aeron)
+  , clientMode :: !ConductorMode
+  }
 
 data AeronConfig = AeronConfig
   { aeronDir :: Maybe FilePath
@@ -94,11 +141,21 @@ data AeronConfig = AeronConfig
   @AERON_DIR@ environment variable).
   -}
   , clientName :: Maybe String
+  , conductorMode :: ConductorMode
+  , onError :: Maybe (Int -> String -> IO ())
+  {- ^ Called for errors the conductor raises out-of-band, which would otherwise
+  go to Aeron's default handler (which aborts the process).
+  -}
   }
-  deriving stock (Eq, Show)
 
 defaultConfig :: AeronConfig
-defaultConfig = AeronConfig {aeronDir = Nothing, clientName = Nothing}
+defaultConfig =
+  AeronConfig
+    { aeronDir = Nothing
+    , clientName = Nothing
+    , conductorMode = ConductorThread
+    , onError = Nothing
+    }
 
 {- | Connect to a running media driver, run the body, then shut down.
 
@@ -106,9 +163,11 @@ The body runs on a bound thread; see the module header.
 -}
 withAeron :: AeronConfig -> (Client -> IO a) -> IO a
 withAeron cfg act = runInBoundThread
-  $ withContext cfg
-  $ \ctx ->
-    bracket (startClient ctx) closeClient (act . Client)
+  $ withErrorHandler (onError cfg)
+  $ \errFp ->
+    withContext cfg errFp $ \ctx ->
+      bracket (startClient ctx) closeClient $ \p ->
+        act (Client {clientPtr = p, clientMode = conductorMode cfg})
  where
   startClient ctx = alloca $ \pClient -> do
     _ <- checkNeg "aeron_init" (c_aeron_init pClient ctx)
@@ -118,24 +177,65 @@ withAeron cfg act = runInBoundThread
 
   closeClient client = void (checkNeg "aeron_close" (c_aeron_close client))
 
+{- | The 'FunPtr' must outlive the client that may call it, so it brackets both
+the context and the client.
+-}
+withErrorHandler :: Maybe (Int -> String -> IO ()) -> (FunPtr ErrorHandlerC -> IO a) -> IO a
+withErrorHandler Nothing act = act nullFunPtr
+withErrorHandler (Just h) act =
+  bracket (mkErrorHandler trampoline) freeHaskellFunPtr act
+ where
+  trampoline :: ErrorHandlerC
+  trampoline _clientd code msg = peekCString msg >>= h (fromIntegral code)
+
 -- | The context must outlive the client, so it brackets it.
-withContext :: AeronConfig -> (Ptr T.AeronContext -> IO a) -> IO a
-withContext AeronConfig {aeronDir, clientName} =
+withContext :: AeronConfig -> FunPtr ErrorHandlerC -> (Ptr T.AeronContext -> IO a) -> IO a
+withContext AeronConfig {aeronDir, clientName, conductorMode} errFp =
   bracket acquire release
  where
   acquire = do
     ctx <- alloca $ \pCtx -> do
       _ <- checkNeg "aeron_context_init" (c_aeron_context_init pCtx)
       peek pCtx
-    mapM_
-      (\d -> withCString d $ \c -> checkNeg "aeron_context_set_dir" (c_aeron_context_set_dir ctx c))
-      aeronDir
-    mapM_
-      ( \n -> withCString n $ \c -> checkNeg "aeron_context_set_client_name" (c_aeron_context_set_client_name ctx c)
-      )
-      clientName
+    mapM_ (setStr ctx "aeron_context_set_dir" c_aeron_context_set_dir) aeronDir
+    mapM_ (setStr ctx "aeron_context_set_client_name" c_aeron_context_set_client_name) clientName
+    unless (errFp == nullFunPtr)
+      $ void
+      $ checkNeg "aeron_context_set_error_handler" (c_aeron_context_set_error_handler ctx errFp nullPtr)
+    case conductorMode of
+      ConductorThread -> pure ()
+      AgentInvoker ->
+        void
+          $ checkNeg
+            "aeron_context_set_use_conductor_agent_invoker"
+            (c_aeron_context_set_use_conductor_agent_invoker ctx (CBool 1))
     pure ctx
+
+  setStr ctx op f v = withCString v $ \c -> void (checkNeg op (f ctx c))
+
   release ctx = void (checkNeg "aeron_context_close" (c_aeron_context_close ctx))
+
+{- $invoker
+In 'AgentInvoker' mode nothing progresses — not even registering a
+publication — unless someone runs the conductor. Call 'doWork' in your duty
+cycle, and 'idleStrategy' with its result when you have nothing else to do.
+
+The waiting helpers here ('withPublication', 'awaitConnected', …) pump the
+conductor themselves, so setup works in either mode without special handling.
+-}
+
+{- | Run one conductor duty cycle. Returns the work count.
+
+A no-op in 'ConductorThread' mode, where Aeron's own thread is doing this.
+-}
+doWork :: Client -> IO Int
+doWork Client {clientPtr, clientMode} = case clientMode of
+  ConductorThread -> pure 0
+  AgentInvoker -> fromIntegral <$> checkNeg "aeron_main_do_work" (c_aeron_main_do_work clientPtr)
+
+-- | Idle according to the client's configured strategy, given a work count.
+idleStrategy :: Client -> Int -> IO ()
+idleStrategy Client {clientPtr} n = c_aeron_main_idle_strategy clientPtr (fromIntegral n)
 
 -- Publications -------------------------------------------------------------
 
@@ -143,22 +243,35 @@ newtype Publication = Publication (Ptr T.Publication)
 
 -- | Register a publication and wait for the driver to confirm it.
 withPublication :: Client -> String -> Int32 -> (Publication -> IO a) -> IO a
-withPublication (Client client) uri streamId =
+withPublication client uri streamId =
   bracket acquire release
  where
   acquire = do
     async <- withCString uri $ \cUri -> alloca $ \pAsync -> do
       _ <-
-        checkNeg "aeron_async_add_publication" (c_aeron_async_add_publication pAsync client cUri streamId)
+        checkNeg "aeron_async_add_publication"
+          $ c_aeron_async_add_publication pAsync (clientPtr client) cUri streamId
       peek pAsync
     Publication
-      <$> awaitRegistration "aeron_async_add_publication_poll" (`c_aeron_async_add_publication_poll` async)
+      <$> awaitRegistration
+        client
+        "aeron_async_add_publication_poll"
+        (`c_aeron_async_add_publication_poll` async)
 
   release (Publication p) =
     void (checkNeg "aeron_publication_close" (c_aeron_publication_close p nullPtr nullPtr))
 
 publicationIsConnected :: Publication -> IO Bool
 publicationIsConnected (Publication p) = toBool <$> c_aeron_publication_is_connected p
+
+{- | Fixed properties of the publication. 'pcMaxPayloadLength' is the ceiling on
+a 'tryClaim'; 'pcMaxMessageLength' is the ceiling on an 'offer'.
+-}
+publicationConstants :: Publication -> IO PublicationConstants
+publicationConstants (Publication p) =
+  allocaBytes publicationConstantsSize $ \buf -> do
+    _ <- checkNeg "aeron_publication_constants" (c_aeron_publication_constants p buf)
+    peekPublicationConstants buf
 
 {- | Offer a message from a raw buffer. Non-blocking; nothing is copied by the
 binding, though Aeron itself copies into the log buffer.
@@ -186,7 +299,7 @@ pointer is valid only for the duration of the callback, and only @len@ bytes
 may be written.
 
 Returns 'Left' if the claim could not be made (e.g. 'BackPressured'). Claims
-are limited to less than the MTU; use 'offer' for larger messages.
+are limited to 'pcMaxPayloadLength'; use 'offer' for larger messages.
 -}
 tryClaim :: Publication -> Int -> (Ptr Word8 -> IO a) -> IO (Either PublicationResult a)
 tryClaim (Publication p) len write =
@@ -204,26 +317,87 @@ tryClaim (Publication p) len write =
 
 newtype Subscription = Subscription (Ptr T.Subscription)
 
+-- | One publisher's stream within a subscription.
+newtype Image = Image (Ptr T.Image)
+
+imageConstants :: Image -> IO ImageConstants
+imageConstants (Image i) =
+  allocaBytes imageConstantsSize $ \buf -> do
+    _ <- checkNeg "aeron_image_constants" (c_aeron_image_constants i buf)
+    peekImageConstants buf
+
+{- | Notifications for publishers joining and leaving.
+
+These fire from the conductor: on a C-spawned thread in 'ConductorThread' mode,
+or on whichever thread calls 'doWork' under 'AgentInvoker'. Keep them short, and
+do not call back into Aeron from them.
+
+The 'Image' is only valid for the duration of the callback.
+-}
+data SubscriptionOpts = SubscriptionOpts
+  { onImageAvailable :: Maybe (Image -> IO ())
+  , onImageUnavailable :: Maybe (Image -> IO ())
+  }
+
+defaultSubscriptionOpts :: SubscriptionOpts
+defaultSubscriptionOpts =
+  SubscriptionOpts {onImageAvailable = Nothing, onImageUnavailable = Nothing}
+
 withSubscription :: Client -> String -> Int32 -> (Subscription -> IO a) -> IO a
-withSubscription (Client client) uri streamId =
-  bracket acquire release
+withSubscription client = withSubscriptionOpts client defaultSubscriptionOpts
+
+withSubscriptionOpts ::
+  Client -> SubscriptionOpts -> String -> Int32 -> (Subscription -> IO a) -> IO a
+withSubscriptionOpts client opts uri streamId act =
+  -- The handler FunPtrs must outlive the subscription that may invoke them.
+  withImageHandler (onImageAvailable opts) $ \availFp ->
+    withImageHandler (onImageUnavailable opts) $ \unavailFp ->
+      bracket (acquire availFp unavailFp) release act
  where
-  acquire = do
+  acquire availFp unavailFp = do
     async <- withCString uri $ \cUri -> alloca $ \pAsync -> do
-      -- The four NULLs are the available/unavailable image handlers and their
-      -- clientd. Wired up in M3.
       _ <-
         checkNeg "aeron_async_add_subscription"
-          $ c_aeron_async_add_subscription pAsync client cUri streamId nullPtr nullPtr nullPtr nullPtr
+          $ c_aeron_async_add_subscription
+            pAsync
+            (clientPtr client)
+            cUri
+            streamId
+            availFp
+            nullPtr
+            unavailFp
+            nullPtr
       peek pAsync
     Subscription
-      <$> awaitRegistration "aeron_async_add_subscription_poll" (`c_aeron_async_add_subscription_poll` async)
+      <$> awaitRegistration
+        client
+        "aeron_async_add_subscription_poll"
+        (`c_aeron_async_add_subscription_poll` async)
 
   release (Subscription s) =
     void (checkNeg "aeron_subscription_close" (c_aeron_subscription_close s nullPtr nullPtr))
 
+withImageHandler :: Maybe (Image -> IO ()) -> (FunPtr ImageHandlerC -> IO a) -> IO a
+withImageHandler Nothing act = act nullFunPtr
+withImageHandler (Just h) act =
+  bracket (mkImageHandler trampoline) freeHaskellFunPtr act
+ where
+  trampoline :: ImageHandlerC
+  trampoline _clientd _sub img = h (Image img)
+
 subscriptionIsConnected :: Subscription -> IO Bool
 subscriptionIsConnected (Subscription s) = toBool <$> c_aeron_subscription_is_connected s
+
+-- | How many publishers are currently feeding this subscription.
+subscriptionImageCount :: Subscription -> IO Int
+subscriptionImageCount (Subscription s) =
+  fromIntegral <$> checkNeg "aeron_subscription_image_count" (c_aeron_subscription_image_count s)
+
+subscriptionConstants :: Subscription -> IO SubscriptionConstants
+subscriptionConstants (Subscription s) =
+  allocaBytes subscriptionConstantsSize $ \buf -> do
+    _ <- checkNeg "aeron_subscription_constants" (c_aeron_subscription_constants s buf)
+    peekSubscriptionConstants buf
 
 {- | A message fragment, as a view into Aeron's log buffer.
 
@@ -246,59 +420,100 @@ fragmentByteString Fragment {fragmentData, fragmentLength} =
 
 {- | A subscription bound to a fragment handler.
 
-The C function pointer is created once, here, rather than per poll — building
-a 'FunPtr' on every call would allocate on the hot path.
+The C function pointer is built once, here, rather than per poll — creating a
+'FunPtr' on every call would allocate on the hot path.
 -}
 data Poller = Poller
   { pollerSub :: !(Ptr T.Subscription)
   , pollerFun :: !(FunPtr FragmentHandlerC)
+  , pollerClientd :: !(Ptr ())
   }
 
--- | Bind a handler to a subscription for the duration of the body.
+{- | Bind a handler to a subscription for the duration of the body.
+
+The handler sees raw fragments. A message larger than the MTU arrives as
+several of them; use 'withAssemblingPoller' if you need whole messages.
+-}
 withPoller :: Subscription -> (Fragment -> IO ()) -> (Poller -> IO a) -> IO a
 withPoller (Subscription sub) handler act =
-  bracket (mkFragmentHandler trampoline) freeHaskellFunPtr $ \fp ->
-    act (Poller {pollerSub = sub, pollerFun = fp})
+  bracket (mkFragmentHandler (fragmentTrampoline handler)) freeHaskellFunPtr $ \fp ->
+    act (Poller {pollerSub = sub, pollerFun = fp, pollerClientd = nullPtr})
+
+{- | Like 'withPoller', but reassembles messages that were fragmented across
+several frames, so the handler always sees a whole message.
+
+The reassembled payload lives in the assembler's own buffer rather than the log
+buffer, but the lifetime rule is unchanged: it is only valid for the duration of
+the call.
+-}
+withAssemblingPoller :: Subscription -> (Fragment -> IO ()) -> (Poller -> IO a) -> IO a
+withAssemblingPoller (Subscription sub) handler act =
+  bracket (mkFragmentHandler (fragmentTrampoline handler)) freeHaskellFunPtr $ \delegate ->
+    bracket (createAssembler delegate) deleteAssembler $ \asm ->
+      -- Aeron's own handler does the assembling and calls our delegate, which it
+      -- finds via the assembler passed as clientd.
+      act
+        ( Poller
+            { pollerSub = sub
+            , pollerFun = p_aeron_fragment_assembler_handler
+            , pollerClientd = castPtr asm
+            }
+        )
  where
-  trampoline :: FragmentHandlerC
-  trampoline _clientd buf len hdr =
-    handler (Fragment {fragmentData = buf, fragmentLength = fromIntegral len, fragmentHeader = hdr})
+  createAssembler delegate = alloca $ \pAsm -> do
+    _ <-
+      checkNeg "aeron_fragment_assembler_create"
+        $ c_aeron_fragment_assembler_create pAsm delegate nullPtr
+    peek pAsm
+
+  deleteAssembler asm =
+    void (checkNeg "aeron_fragment_assembler_delete" (c_aeron_fragment_assembler_delete asm))
+
+fragmentTrampoline :: (Fragment -> IO ()) -> FragmentHandlerC
+fragmentTrampoline handler _clientd buf len hdr =
+  handler
+    Fragment
+      { fragmentData = buf
+      , fragmentLength = fromIntegral len
+      , fragmentHeader = hdr
+      }
 
 {- | Poll for up to @fragmentLimit@ fragments, returning how many were handled.
 
 The handler is invoked synchronously, once per fragment, before this returns.
 -}
 pollFragments :: Poller -> Int -> IO Int
-pollFragments Poller {pollerSub, pollerFun} fragmentLimit =
+pollFragments Poller {pollerSub, pollerFun, pollerClientd} fragmentLimit =
   fromIntegral
     <$> checkNeg
       "aeron_subscription_poll"
-      (c_aeron_subscription_poll pollerSub pollerFun nullPtr (fromIntegral fragmentLimit))
+      (c_aeron_subscription_poll pollerSub pollerFun pollerClientd (fromIntegral fragmentLimit))
 
 -- Waiting ------------------------------------------------------------------
 
-{- | Spin until a predicate holds, or throw after @timeoutSeconds@.
+{- | Spin until a predicate holds, or throw after @timeoutSeconds@. Pumps the
+conductor, so it works under 'AgentInvoker'.
 
 Intended for setup (waiting for a publication to connect), not the hot path.
 -}
-awaitConnected :: Double -> IO Bool -> IO ()
-awaitConnected timeoutSeconds check = do
+awaitConnected :: Client -> Double -> IO Bool -> IO ()
+awaitConnected client timeoutSeconds check = do
   deadline <- (+ timeoutSeconds) <$> getMonotonicTime
-  go deadline
- where
-  go deadline = do
-    ok <- check
-    unless ok $ do
-      now <- getMonotonicTime
-      if now > deadline
-        then throwAeron "awaitConnected: timed out"
-        else threadDelay 1000 >> go deadline
+  let go = do
+        ok <- check
+        unless ok $ do
+          _ <- doWork client
+          now <- getMonotonicTime
+          if now > deadline
+            then throwAeron "awaitConnected: timed out"
+            else threadDelay 1000 >> go
+  go
 
-{- | Drive an async registration to completion. Returns 1 when done, 0 while
-pending, negative on error.
+{- | Drive an async registration to completion: the poll returns 1 when done, 0
+while pending, negative on error.
 -}
-awaitRegistration :: String -> (Ptr (Ptr a) -> IO CInt) -> IO (Ptr a)
-awaitRegistration op pollOnce = alloca $ \out -> do
+awaitRegistration :: Client -> String -> (Ptr (Ptr a) -> IO CInt) -> IO (Ptr a)
+awaitRegistration client op pollOnce = alloca $ \out -> do
   deadline <- (+ registrationTimeout) <$> getMonotonicTime
   let go = do
         r <- pollOnce out
@@ -306,6 +521,8 @@ awaitRegistration op pollOnce = alloca $ \out -> do
           LT -> throwAeron op
           GT -> peek out
           EQ -> do
+            -- Under AgentInvoker nobody else will advance the registration.
+            _ <- doWork client
             now <- getMonotonicTime
             if now > deadline
               then throwAeron (op <> ": timed out")

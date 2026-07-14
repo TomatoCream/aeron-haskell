@@ -28,11 +28,15 @@ module Aeron.FFI.Raw (
   c_aeron_context_close,
   c_aeron_context_set_dir,
   c_aeron_context_set_client_name,
+  c_aeron_context_set_error_handler,
+  c_aeron_context_set_use_conductor_agent_invoker,
 
   -- * Client
   c_aeron_init,
   c_aeron_start,
   c_aeron_close,
+  c_aeron_main_do_work,
+  c_aeron_main_idle_strategy,
 
   -- * Publication
   c_aeron_async_add_publication,
@@ -43,6 +47,7 @@ module Aeron.FFI.Raw (
   c_aeron_buffer_claim_abort,
   c_aeron_publication_is_connected,
   c_aeron_publication_close,
+  c_aeron_publication_constants,
 
   -- * Subscription
   c_aeron_async_add_subscription,
@@ -50,9 +55,21 @@ module Aeron.FFI.Raw (
   c_aeron_subscription_poll,
   c_aeron_subscription_is_connected,
   c_aeron_subscription_close,
+  c_aeron_subscription_constants,
+  c_aeron_subscription_image_count,
+
+  -- * Images
+  c_aeron_image_constants,
+
+  -- * Fragment assembly
+  c_aeron_fragment_assembler_create,
+  c_aeron_fragment_assembler_delete,
+  p_aeron_fragment_assembler_handler,
 
   -- * Callbacks
   mkFragmentHandler,
+  mkErrorHandler,
+  mkImageHandler,
 
   -- * Version
   c_aeron_version_full,
@@ -64,7 +81,11 @@ import Aeron.FFI.Types (
   AsyncAddPublication,
   AsyncAddSubscription,
   BufferClaim,
+  ErrorHandlerC,
+  FragmentAssembler,
   FragmentHandlerC,
+  Image,
+  ImageHandlerC,
   Publication,
   Subscription,
  )
@@ -101,6 +122,17 @@ foreign import ccall unsafe "aeron/aeronc.h aeron_context_set_dir"
 foreign import ccall unsafe "aeron/aeronc.h aeron_context_set_client_name"
   c_aeron_context_set_client_name :: Ptr AeronContext -> CString -> IO CInt
 
+foreign import ccall unsafe "aeron/aeronc.h aeron_context_set_error_handler"
+  c_aeron_context_set_error_handler ::
+    Ptr AeronContext -> FunPtr ErrorHandlerC -> Ptr () -> IO CInt
+
+{- | Switch the conductor from its own thread to being driven by
+'c_aeron_main_do_work'. See "Aeron"'s @ConductorMode@.
+-}
+foreign import ccall unsafe "aeron/aeronc.h aeron_context_set_use_conductor_agent_invoker"
+  c_aeron_context_set_use_conductor_agent_invoker ::
+    Ptr AeronContext -> CBool -> IO CInt
+
 -- Client -------------------------------------------------------------------
 
 -- | Maps the CnC file: does real file I/O and can block.
@@ -114,6 +146,17 @@ foreign import ccall safe "aeron/aeronc.h aeron_start"
 -- | Joins the conductor thread; blocks.
 foreign import ccall safe "aeron/aeronc.h aeron_close"
   c_aeron_close :: Ptr Aeron -> IO CInt
+
+{- | One conductor duty cycle, in agent-invoker mode. Must be @safe@: the
+conductor is what dispatches the error and image callbacks, so this call can
+re-enter Haskell.
+-}
+foreign import ccall safe "aeron/aeronc.h aeron_main_do_work"
+  c_aeron_main_do_work :: Ptr Aeron -> IO CInt
+
+-- | Idle according to the client's configured idle strategy. Can sleep.
+foreign import ccall safe "aeron/aeronc.h aeron_main_idle_strategy"
+  c_aeron_main_idle_strategy :: Ptr Aeron -> CInt -> IO ()
 
 -- Publication --------------------------------------------------------------
 
@@ -157,18 +200,25 @@ foreign import ccall unsafe "aeron/aeronc.h aeron_publication_is_connected"
 foreign import ccall safe "aeron/aeronc.h aeron_publication_close"
   c_aeron_publication_close :: Ptr Publication -> Ptr () -> Ptr () -> IO CInt
 
+-- | Fills a caller-allocated @aeron_publication_constants_t@.
+foreign import ccall unsafe "aeron/aeronc.h aeron_publication_constants"
+  c_aeron_publication_constants :: Ptr Publication -> Ptr a -> IO CInt
+
 -- Subscription -------------------------------------------------------------
 
--- | The two image handlers are passed as NULL until M3.
+{- | The image handlers may be 'Foreign.Ptr.nullFunPtr'. When they are not, they
+are dispatched by the conductor — on a C-spawned thread in 'ConductorThread'
+mode, or on whichever thread calls 'c_aeron_main_do_work' in invoker mode.
+-}
 foreign import ccall unsafe "aeron/aeronc.h aeron_async_add_subscription"
   c_aeron_async_add_subscription ::
     Ptr (Ptr AsyncAddSubscription) ->
     Ptr Aeron ->
     CString ->
     Int32 ->
-    Ptr () -> -- on_available_image
+    FunPtr ImageHandlerC -> -- on_available_image
     Ptr () -> -- available_clientd
-    Ptr () -> -- on_unavailable_image
+    FunPtr ImageHandlerC -> -- on_unavailable_image
     Ptr () -> -- unavailable_clientd
     IO CInt
 
@@ -194,15 +244,59 @@ foreign import ccall unsafe "aeron/aeronc.h aeron_subscription_is_connected"
 foreign import ccall safe "aeron/aeronc.h aeron_subscription_close"
   c_aeron_subscription_close :: Ptr Subscription -> Ptr () -> Ptr () -> IO CInt
 
+-- | Fills a caller-allocated @aeron_subscription_constants_t@.
+foreign import ccall unsafe "aeron/aeronc.h aeron_subscription_constants"
+  c_aeron_subscription_constants :: Ptr Subscription -> Ptr a -> IO CInt
+
+-- | How many publishers are currently feeding this subscription.
+foreign import ccall unsafe "aeron/aeronc.h aeron_subscription_image_count"
+  c_aeron_subscription_image_count :: Ptr Subscription -> IO CInt
+
+-- Images -------------------------------------------------------------------
+
+foreign import ccall unsafe "aeron/aeronc.h aeron_image_constants"
+  c_aeron_image_constants :: Ptr Image -> Ptr a -> IO CInt
+
+-- Fragment assembly --------------------------------------------------------
+
+{- $assembly
+Messages larger than the MTU arrive as several fragments. The assembler
+buffers them and invokes its delegate once, with the reassembled whole.
+
+It is used by poking it into the /clientd/ of a poll whose handler is
+'p_aeron_fragment_assembler_handler' — the assembler is C's own handler, and
+our Haskell delegate hangs off it.
+-}
+
+foreign import ccall unsafe "aeron/aeronc.h aeron_fragment_assembler_create"
+  c_aeron_fragment_assembler_create ::
+    Ptr (Ptr FragmentAssembler) -> FunPtr FragmentHandlerC -> Ptr () -> IO CInt
+
+foreign import ccall unsafe "aeron/aeronc.h aeron_fragment_assembler_delete"
+  c_aeron_fragment_assembler_delete :: Ptr FragmentAssembler -> IO CInt
+
+{- | The /address of/ Aeron's own assembling handler, to be passed as the poll
+handler. Not a Haskell 'FunPtr' — nothing to free.
+-}
+foreign import ccall unsafe "&aeron_fragment_assembler_handler"
+  p_aeron_fragment_assembler_handler :: FunPtr FragmentHandlerC
+
 -- Callbacks ----------------------------------------------------------------
 
-{- | Wrap a Haskell fragment handler as a C function pointer.
-
-The returned 'FunPtr' owns a stable pointer to the closure and must be
-released with 'Foreign.Ptr.freeHaskellFunPtr'.
+{- $wrappers
+Each of these turns a Haskell closure into a C function pointer backed by a
+stable pointer. Every one must be released with
+'Foreign.Ptr.freeHaskellFunPtr', or the closure leaks.
 -}
+
 foreign import ccall "wrapper"
   mkFragmentHandler :: FragmentHandlerC -> IO (FunPtr FragmentHandlerC)
+
+foreign import ccall "wrapper"
+  mkErrorHandler :: ErrorHandlerC -> IO (FunPtr ErrorHandlerC)
+
+foreign import ccall "wrapper"
+  mkImageHandler :: ImageHandlerC -> IO (FunPtr ImageHandlerC)
 
 -- Version ------------------------------------------------------------------
 
