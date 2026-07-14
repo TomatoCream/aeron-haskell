@@ -49,7 +49,12 @@
           ...
         }:
         let
-          projectName = "my-project";
+          projectName = "aeron-haskell";
+
+          # The Aeron C client. Note: pkgs.aeron is the *Java* distribution
+          # (wrapper scripts only, no C library) -- aeron-cpp is the one that
+          # ships include/aeron/aeronc.h, lib/libaeron.so and bin/aeronmd.
+          aeron = pkgs.aeron-cpp;
 
           project = pkgs.haskell-nix.project' {
             src = lib.cleanSourceWith {
@@ -76,6 +81,18 @@
 
             compiler-nix-name = "ghc9124";
 
+            # `extra-libraries: aeron` in the .cabal file only names the library;
+            # haskell.nix still needs the derivation that provides libaeron.so.
+            modules = [
+              {
+                packages.${projectName}.components = {
+                  library.libs = [ aeron ];
+                  exes.${projectName}.libs = [ aeron ];
+                  tests."${projectName}-test".libs = [ aeron ];
+                };
+              }
+            ];
+
             shell = {
               tools = {
                 cabal = { };
@@ -87,12 +104,19 @@
               # cabal-fmt is not built via haskell.nix `tools`: 0.1.12 caps at
               # base <4.20, so it cannot be compiled against GHC 9.12's base-4.21.
               # nixpkgs builds it against a compiler it supports.
-              buildInputs = with pkgs; [
+              # In the dev shell, stdenv turns these into -isystem/-L flags via
+              # NIX_CFLAGS_COMPILE and NIX_LDFLAGS, which is how plain `cabal
+              # build` finds <aeron/aeronc.h> and -laeron. It also puts `aeronmd`
+              # on PATH, which the integration tests spawn as a media driver.
+              buildInputs = [
+                aeron
+              ]
+              ++ (with pkgs; [
                 just
                 zlib
                 pkg-config
                 haskellPackages.cabal-fmt
-              ];
+              ]);
 
               shellHook = ''
                 export PS1="\n\[\033[1;32m\][${projectName}:\w]\$\[\033[0m\] "
@@ -102,6 +126,7 @@
                 echo "  HLS:      $(haskell-language-server --version 2>/dev/null || echo 'available')"
                 echo "  Fourmolu: $(fourmolu --version 2>/dev/null | head -1 || echo 'available')"
                 echo "  cabal-fmt: $(cabal-fmt --version 2>/dev/null || echo 'available')"
+                echo "  Aeron:    ${aeron.version} ($(command -v aeronmd))"
                 echo ""
               '';
             };
