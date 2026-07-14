@@ -1,6 +1,6 @@
 # M4: batched poll via a C shim
 
-Status: **not started**. Everything below is design, not code.
+Status: **done**. Results at the bottom — the shim earned its place.
 
 ## The problem
 
@@ -124,6 +124,48 @@ benchmark is what makes it so.
 - `aeron_subscription_poll`'s import (via the shim) is `unsafe`.
 - Zero Haskell allocation per fragment on the poll path.
 - A measured, recorded improvement over the M3 baseline.
+
+## Results
+
+IPC, `aeronmd` 1.49.0, GHC 9.12.4 `-O2`, same machine, back to back. M4 numbers
+are the median of two runs that agreed closely (empty poll 10.9 / 10.5 ns).
+
+| measurement            | M3 (safe + FunPtr) | M4 (unsafe + shim) | change    |
+| ---------------------- | ------------------ | ------------------ | --------- |
+| empty poll             | 59.0 ns/call       | 10.9 ns/call       | **5.4× faster** |
+| drain                  | 229.3 ns/fragment  | 69.2 ns/fragment   | **3.3× faster** |
+| drain throughput       | 4.36 M frag/s      | 14.45 M frag/s     | **3.3× more** |
+| round trip p50         | 772 ns             | 361 ns             | **2.1× faster** |
+| round trip p99         | 93,211 ns          | 5,080 ns           | **18× lower** |
+| round trip p99.9       | 183,296 ns         | 7,495 ns           | **24× lower** |
+
+The mean improvements are what the design predicted. **The tail is the surprise,
+and it is the real result.** A `safe` call releases the capability, which lets the
+RTS deschedule the polling thread mid-spin; at p99 the baseline was eating
+~90µs, two orders of magnitude above its own median. The `unsafe` import never
+yields, so the spin stays hot and the tail collapses to ~5µs.
+
+That is worth stating plainly because it inverts the usual reasoning. The
+argument for `unsafe` is normally "the call overhead is 59ns instead of 11ns, who
+cares" — a rounding error against a 772ns round trip. The overhead was never the
+point. **Releasing the capability on every poll was.** For a latency-sensitive
+consumer the correct read of this table is the p99 row, not the p50 row.
+
+## Verdict
+
+Kept. The acceptance criteria were met:
+
+- the seven existing integration tests pass **unchanged**, including MTU-spanning
+  reassembly through the new chained delegate — the API did not move;
+- the poll is imported `unsafe`;
+- no Haskell allocation per fragment on the poll path;
+- a large, repeatable improvement over the baseline.
+
+Note that the assembler needed no new C entry point in the end. Making
+`ah_collect_fragment` the *assembler's delegate* means reassembled messages land
+in the same descriptor array — the assembler is the poll handler, and the
+collector hangs off it. That is simpler than the chaining this document
+originally anticipated.
 
 ## Not in scope
 

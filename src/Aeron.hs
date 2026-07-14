@@ -67,19 +67,27 @@ module Aeron (
   fragmentByteString,
   Poller,
   withPoller,
+  withPollerCapacity,
   withAssemblingPoller,
   pollFragments,
+  defaultBatchCapacity,
 
   -- * Waiting
   awaitConnected,
 ) where
 
 import Aeron.Error (checkNeg, throwAeron)
+import Aeron.FFI.Batch (
+  AhBatch (..),
+  AhFragment (..),
+  c_ah_poll_batch,
+  c_ah_poll_batch_assembled,
+  p_ah_collect_fragment,
+ )
 import Aeron.FFI.Raw
 import Aeron.FFI.Types (
   BufferClaim (..),
   ErrorHandlerC,
-  FragmentHandlerC,
   ImageConstants (..),
   ImageHandlerC,
   PublicationConstants (..),
@@ -110,9 +118,10 @@ import Data.Int (Int32)
 import Data.Word (Word8)
 import Foreign.C.String (peekCString, withCString)
 import Foreign.C.Types (CBool (..), CInt)
-import Foreign.Marshal.Alloc (alloca, allocaBytes)
+import Foreign.Marshal.Alloc (alloca, allocaBytes, free, malloc)
+import Foreign.Marshal.Array (mallocArray)
 import Foreign.Ptr (FunPtr, Ptr, castPtr, freeHaskellFunPtr, nullFunPtr, nullPtr)
-import Foreign.Storable (peek)
+import Foreign.Storable (peek, peekElemOff, poke)
 import GHC.Clock (getMonotonicTime)
 
 -- Client -------------------------------------------------------------------
@@ -420,14 +429,32 @@ fragmentByteString Fragment {fragmentData, fragmentLength} =
 
 {- | A subscription bound to a fragment handler.
 
-The C function pointer is built once, here, rather than per poll — creating a
-'FunPtr' on every call would allocate on the hot path.
+Backed by the C shim (@cbits/aeron_shim.c@): a poll collects fragment
+descriptors into a C array, and the handler is then invoked from ordinary
+Haskell as we walk that array. No Haskell runs inside the poll, which is what
+lets 'Aeron.FFI.Batch.c_ah_poll_batch' be imported @unsafe@.
+
+The descriptor array and batch struct are allocated once, here — allocating
+per poll would reintroduce exactly the cost this design removes.
 -}
 data Poller = Poller
   { pollerSub :: !(Ptr T.Subscription)
-  , pollerFun :: !(FunPtr FragmentHandlerC)
-  , pollerClientd :: !(Ptr ())
+  , pollerHandler :: !(Fragment -> IO ())
+  , pollerBatch :: !(Ptr AhBatch)
+  , pollerFrags :: !(Ptr AhFragment)
+  , pollerAssembler :: !(Maybe (Ptr T.FragmentAssembler))
+  {- ^ When set, the poll goes through Aeron's assembler, so the batch receives
+  whole messages rather than raw frames.
+  -}
   }
+
+{- | How many fragments one poll can collect.
+
+'pollFragments' clamps its limit to this, so it is a ceiling on batch size, not
+a correctness hazard.
+-}
+defaultBatchCapacity :: Int
+defaultBatchCapacity = 1024
 
 {- | Bind a handler to a subscription for the duration of the body.
 
@@ -435,59 +462,97 @@ The handler sees raw fragments. A message larger than the MTU arrives as
 several of them; use 'withAssemblingPoller' if you need whole messages.
 -}
 withPoller :: Subscription -> (Fragment -> IO ()) -> (Poller -> IO a) -> IO a
-withPoller (Subscription sub) handler act =
-  bracket (mkFragmentHandler (fragmentTrampoline handler)) freeHaskellFunPtr $ \fp ->
-    act (Poller {pollerSub = sub, pollerFun = fp, pollerClientd = nullPtr})
+withPoller = withPollerCapacity defaultBatchCapacity
+
+-- | 'withPoller' with an explicit batch capacity.
+withPollerCapacity :: Int -> Subscription -> (Fragment -> IO ()) -> (Poller -> IO a) -> IO a
+withPollerCapacity cap (Subscription sub) handler act =
+  withBatch cap $ \batch frags ->
+    act
+      Poller
+        { pollerSub = sub
+        , pollerHandler = handler
+        , pollerBatch = batch
+        , pollerFrags = frags
+        , pollerAssembler = Nothing
+        }
 
 {- | Like 'withPoller', but reassembles messages that were fragmented across
 several frames, so the handler always sees a whole message.
 
+The assembler's delegate is the C collector, so reassembled messages land in the
+same descriptor array and no Haskell runs during the poll here either.
+
 The reassembled payload lives in the assembler's own buffer rather than the log
-buffer, but the lifetime rule is unchanged: it is only valid for the duration of
-the call.
+buffer, but the lifetime rule is unchanged: valid only until the next poll.
 -}
 withAssemblingPoller :: Subscription -> (Fragment -> IO ()) -> (Poller -> IO a) -> IO a
 withAssemblingPoller (Subscription sub) handler act =
-  bracket (mkFragmentHandler (fragmentTrampoline handler)) freeHaskellFunPtr $ \delegate ->
-    bracket (createAssembler delegate) deleteAssembler $ \asm ->
-      -- Aeron's own handler does the assembling and calls our delegate, which it
-      -- finds via the assembler passed as clientd.
+  withBatch defaultBatchCapacity $ \batch frags ->
+    bracket (createAssembler batch) deleteAssembler $ \asm ->
       act
-        ( Poller
-            { pollerSub = sub
-            , pollerFun = p_aeron_fragment_assembler_handler
-            , pollerClientd = castPtr asm
-            }
-        )
+        Poller
+          { pollerSub = sub
+          , pollerHandler = handler
+          , pollerBatch = batch
+          , pollerFrags = frags
+          , pollerAssembler = Just asm
+          }
  where
-  createAssembler delegate = alloca $ \pAsm -> do
+  -- The delegate is C's collector, bound to our batch.
+  createAssembler batch = alloca $ \pAsm -> do
     _ <-
       checkNeg "aeron_fragment_assembler_create"
-        $ c_aeron_fragment_assembler_create pAsm delegate nullPtr
+        $ c_aeron_fragment_assembler_create pAsm p_ah_collect_fragment (castPtr batch)
     peek pAsm
 
   deleteAssembler asm =
     void (checkNeg "aeron_fragment_assembler_delete" (c_aeron_fragment_assembler_delete asm))
 
-fragmentTrampoline :: (Fragment -> IO ()) -> FragmentHandlerC
-fragmentTrampoline handler _clientd buf len hdr =
-  handler
-    Fragment
-      { fragmentData = buf
-      , fragmentLength = fromIntegral len
-      , fragmentHeader = hdr
-      }
+-- | Allocate the descriptor array and the batch struct that points at it.
+withBatch :: Int -> (Ptr AhBatch -> Ptr AhFragment -> IO a) -> IO a
+withBatch cap act =
+  bracket (mallocArray cap) free $ \frags ->
+    bracket malloc free $ \batch -> do
+      poke
+        batch
+        AhBatch
+          { ahFragments = frags
+          , ahCapacity = fromIntegral cap
+          , ahCount = 0
+          }
+      act batch frags
 
 {- | Poll for up to @fragmentLimit@ fragments, returning how many were handled.
 
-The handler is invoked synchronously, once per fragment, before this returns.
+The limit is clamped to the poller's batch capacity. The handler is invoked
+once per fragment, synchronously, before this returns.
+
+The fragment pointers are only valid until the next poll on this subscription,
+which is why the handler runs inside this call rather than being handed a batch
+to keep.
 -}
 pollFragments :: Poller -> Int -> IO Int
-pollFragments Poller {pollerSub, pollerFun, pollerClientd} fragmentLimit =
-  fromIntegral
-    <$> checkNeg
-      "aeron_subscription_poll"
-      (c_aeron_subscription_poll pollerSub pollerFun pollerClientd (fromIntegral fragmentLimit))
+pollFragments Poller {pollerSub, pollerHandler, pollerBatch, pollerFrags, pollerAssembler} limit = do
+  n <-
+    checkNeg "ah_poll_batch" $ case pollerAssembler of
+      Nothing -> c_ah_poll_batch pollerSub pollerBatch (fromIntegral limit)
+      Just asm -> c_ah_poll_batch_assembled pollerSub asm pollerBatch (fromIntegral limit)
+  let count = fromIntegral n
+  dispatch 0 count
+  pure count
+ where
+  dispatch !i !n
+    | i >= n = pure ()
+    | otherwise = do
+        AhFragment {ahData, ahLength, ahHeader} <- peekElemOff pollerFrags i
+        pollerHandler
+          Fragment
+            { fragmentData = ahData
+            , fragmentLength = fromIntegral ahLength
+            , fragmentHeader = ahHeader
+            }
+        dispatch (i + 1) n
 
 -- Waiting ------------------------------------------------------------------
 

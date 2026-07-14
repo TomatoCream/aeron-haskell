@@ -25,18 +25,28 @@ common common-options
     TypeApplications
 
 library
-  import:          common-options
-  hs-source-dirs:  src
+  import:           common-options
+  hs-source-dirs:   src
   exposed-modules:
     Aeron
     Aeron.Error
+    Aeron.FFI.Batch
     Aeron.FFI.Raw
     Aeron.FFI.Types
+
+  -- The batching shim. It is what lets the poll be imported `unsafe`: GHC
+  -- forbids an unsafe call from re-entering Haskell, so the fragment handler
+  -- has to be C. See docs/m4-batched-poll.md.
+  c-sources:        cbits/aeron_shim.c
+  includes:         aeron_shim.h
+  install-includes: aeron_shim.h
+  include-dirs:     cbits
+  cc-options:       -O2 -Wall
 
   -- The C client lives in libaeron.so (NOT libaeron_client_shared.so, which is
   -- the C++ wrapper and exports none of the aeron_* C symbols). aeron-cpp ships
   -- no pkg-config file, so include/lib dirs come from Nix buildInputs.
-  extra-libraries: aeron
+  extra-libraries:  aeron
   build-depends:
     , base        >=4.17 && <5
     , bytestring
@@ -51,6 +61,21 @@ executable aeron-haskell
   build-depends:
     , aeron-haskell
     , base           >=4.17 && <5
+
+benchmark aeron-haskell-bench
+  import:         common-options
+  type:           exitcode-stdio-1.0
+  hs-source-dirs: bench
+  main-is:        Main.hs
+
+  -- -O2 matters here: the measurement loops must not be the bottleneck.
+  ghc-options:    -threaded -rtsopts -O2 -with-rtsopts=-N2
+  build-depends:
+    , aeron-haskell
+    , base           >=4.17 && <5
+    , bytestring
+    , directory
+    , process
 
 test-suite aeron-haskell-test
   import:         common-options
