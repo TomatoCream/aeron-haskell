@@ -120,7 +120,7 @@ benchDrain dir =
             (fromIntegral drainMsgs * 1000 / total :: Double)
 
 throughputMsgs :: Int
-throughputMsgs = 2_000_000
+throughputMsgs = 20_000_000
 
 throughputMsgSize :: Int
 throughputMsgSize = 1024

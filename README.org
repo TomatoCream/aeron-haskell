@@ -184,7 +184,7 @@ a =safe= call plus per-fragment FunPtr trampoline:
 | round trip p99.9   | 183,296 ns    | 7,495 ns       | 24× lower   |
 
 Sustained end-to-end throughput (publisher and subscriber on separate threads,
-2M × 1 KiB messages over IPC) runs at *~6 M msg/s, ~6 GB/s*.
+20M × 1 KiB messages over IPC) runs at *~9 M msg/s, ~9 GB/s*.
 
 The *tail* is the real result of the shim. A =safe= call releases the RTS capability, letting
 the polling thread be descheduled mid-spin — the baseline p99 sat two orders of
