@@ -427,13 +427,13 @@ pollFragments Poller{pollerSub, pollerHandler, pollerBatch, pollerFrags, pollerA
         dispatch (i + 1) n
 #+end_src
 
-| aspect                | M3: =safe= + FunPtr                  | M4: =unsafe= + shim              |
-|-----------------------+--------------------------------------+----------------------------------|
+| aspect                | M3: =safe= + FunPtr                   | M4: =unsafe= + shim              |
+|-----------------------+-------------------------------------+--------------------------------|
 | poll call             | =safe= (~100 ns, releases capability) | =unsafe= (~few ns, never yields) |
-| handler is            | Haskell closure wrapped as =FunPtr=  | plain =Fragment -> IO ()=        |
-| per-fragment crossing | C→Haskell adjustor trampoline        | a =peek= + call, no FFI          |
-| FFI crossings / poll  | *1 + N*                              | *1*                              |
-| =unsafe= possible?    | *no — illegal* with a FunPtr handler | yes                              |
+| handler is            | Haskell closure wrapped as =FunPtr=   | plain =Fragment -> IO ()=        |
+| per-fragment crossing | C→Haskell adjustor trampoline       | a =peek= + call, no FFI          |
+| FFI crossings / poll  | *1 + N*                               | *1*                              |
+| =unsafe= possible?      | *no — illegal* with a FunPtr handler  | yes                            |
 
 The two data types tell the same story at a glance: M3's =Poller= carries a
 =FunPtr= (the boundary lives /in/ the poller); M4's carries a plain
