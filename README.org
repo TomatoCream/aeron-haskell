@@ -183,7 +183,10 @@ a =safe= call plus per-fragment FunPtr trampoline:
 | round trip p99     |  93,211 ns    | 5,080 ns       | 18× lower   |
 | round trip p99.9   | 183,296 ns    | 7,495 ns       | 24× lower   |
 
-The *tail* is the real result. A =safe= call releases the RTS capability, letting
+Sustained end-to-end throughput (publisher and subscriber on separate threads,
+2M × 32-byte messages over IPC) runs at *~15 M msg/s, ~500 MB/s*.
+
+The *tail* is the real result of the shim. A =safe= call releases the RTS capability, letting
 the polling thread be descheduled mid-spin — the baseline p99 sat two orders of
 magnitude above its median. The =unsafe= import never yields, so a spin-poll loop
 stays hot. Reproduce with =just bench=.

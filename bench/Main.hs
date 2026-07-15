@@ -1,17 +1,22 @@
 {- | Benchmarks for the poll path, which is what M4 changes.
 
-Three measurements, chosen because each isolates a different cost:
+Four measurements, chosen because each isolates a different cost:
 
 * __empty poll__ — one @aeron_subscription_poll@ against an idle subscription.
   No fragments, so this is purely the foreign-call overhead. This is the number
   that a @safe@ → @unsafe@ import should move.
 
-* __drain__ — cost per fragment when draining a pre-filled stream. This is the
-  number that removing the per-fragment C → Haskell trampoline should move.
+* __drain__ — cost per fragment when draining a pre-filled stream on one thread.
+  This is the number that removing the per-fragment C → Haskell trampoline should
+  move.
+
+* __throughput__ — sustained end-to-end messages/sec, publisher and subscriber on
+  separate threads. Includes real cross-thread transport and back-pressure, which
+  @drain@ deliberately excludes.
 
 * __round trip__ — end-to-end IPC ping-pong latency between two clients on two
   bound threads. The number anyone actually cares about, and the one where the
-  above two either show up or don't.
+  above either show up or don't.
 
 Samples are written into a preallocated buffer rather than a list, so the
 measurement loop itself does not allocate and drag the GC into the numbers.
@@ -54,6 +59,7 @@ main = do
     putStrLn "backend: batched C shim, unsafe poll (M4)\n"
     benchEmptyPoll dir
     benchDrain dir
+    benchThroughput dir
     benchRoundTrip dir
 
 -- Benchmarks ---------------------------------------------------------------
@@ -112,6 +118,74 @@ benchDrain dir =
             (total / fromIntegral drainMsgs)
             drainMsgs
             (fromIntegral drainMsgs * 1000 / total :: Double)
+
+throughputMsgs :: Int
+throughputMsgs = 2_000_000
+
+throughputMsgSize :: Int
+throughputMsgSize = 32
+
+{- | Sustained end-to-end throughput: a publisher thread offers flat out while a
+separate subscriber thread drains, timed from the first offer to the last
+message arriving. This is the number a data feed cares about — unlike 'benchDrain'
+(single thread, pre-filled) it includes real cross-thread transport and the
+back-pressure the publisher feels when the subscriber falls behind.
+
+Publisher and subscriber are separate clients on separate bound threads, since
+that is how a throughput workload is actually deployed.
+-}
+benchThroughput :: FilePath -> IO ()
+benchThroughput dir = do
+  subReady <- newIORef False
+  subDone <- newIORef False
+  endTime <- newIORef (0 :: Word64)
+  received <- newIORef (0 :: Int)
+
+  _ <- forkOS (subscriber dir subReady subDone received endTime)
+  waitFor subReady
+
+  withClient dir $ \client ->
+    withPublication client "aeron:ipc" 2005 $ \pub -> do
+      awaitConnected client 10 (publicationIsConnected pub)
+      let msg = BS.replicate throughputMsgSize 0x54
+
+      t0 <- getMonotonicTimeNSec
+      loopN throughputMsgs (const (offerBlocking pub msg))
+      -- The subscriber records the end time once it has them all, then flags
+      -- done, so reading endTime after `done` cannot race the write.
+      waitFor subDone
+      t1 <- readIORef endTime
+
+      got <- readIORef received
+      unless (got == throughputMsgs)
+        $ throwIO (userError ("received " <> show got <> " of " <> show throughputMsgs))
+
+      let elapsed = fromIntegral (t1 - t0) :: Double
+          secs = elapsed / 1e9
+          bytes = fromIntegral (throughputMsgs * throughputMsgSize) :: Double
+      printf
+        "throughput : %.2f M msg/s  %.0f MB/s  (%d x %dB in %.2f s)\n"
+        (fromIntegral throughputMsgs / secs / 1e6)
+        (bytes / secs / 1e6)
+        throughputMsgs
+        throughputMsgSize
+        secs
+
+-- | The draining half of the throughput run, on its own client and bound thread.
+subscriber :: FilePath -> IORef Bool -> IORef Bool -> IORef Int -> IORef Word64 -> IO ()
+subscriber dir ready done received endTime =
+  withClient dir $ \client ->
+    withSubscription client "aeron:ipc" 2005 $ \sub ->
+      -- A generous batch: fewer poll calls per message when the stream is hot.
+      withPollerCapacity 4096 sub (const (modifyCount received)) $ \poller -> do
+        writeIORef ready True
+        let loop = do
+              _ <- pollFragments poller 256
+              n <- readIORef received
+              if n >= throughputMsgs
+                then getMonotonicTimeNSec >>= writeIORef endTime >> writeIORef done True
+                else loop
+        loop
 
 rttIters :: Int
 rttIters = 50_000
