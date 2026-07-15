@@ -4,7 +4,7 @@ version:         0.1.0.0
 synopsis:        Haskell bindings to the Aeron C client
 license:         MIT
 build-type:      Simple
-extra-doc-files: README.md
+extra-doc-files: README.org
 
 common common-options
   default-language:   GHC2021

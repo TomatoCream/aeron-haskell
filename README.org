@@ -1,0 +1,239 @@
+#+TITLE: aeron-haskell
+#+SUBTITLE: Haskell bindings to the Aeron C client
+#+OPTIONS: toc:2 num:nil
+#+STARTUP: showall
+
+Low-latency Haskell bindings to the [[https://github.com/aeron-io/aeron][Aeron]] C client (=aeronc.h=): publications,
+subscriptions, zero-copy send and receive, fragment assembly, counters-free
+lifecycle, and both conductor threading modes. The receive path is batched
+through a small C shim so the hot poll can be imported =unsafe=.
+
+* TL;DR — what to run
+
+Everything runs through [[https://github.com/casey/just][just]]; every recipe re-enters the Nix dev shell for you.
+
+#+begin_src shell
+just build          # build library, demo, tests, benchmark
+just test           # run the integration tests (spawn their own driver)
+just bench          # run the poll-path benchmark
+#+end_src
+
+To run the *demo*, you need a media driver. Aeron does nothing without one — it
+is a separate process that owns the shared-memory transport. Open two terminals:
+
+#+begin_src shell
+# terminal 1: the media driver, left running
+just driver
+
+# terminal 2: the demo, which connects to it
+just run
+#+end_src
+
+The demo publishes one message over IPC and polls it back:
+
+#+begin_example
+offered, stream position now 64
+received: "hello from haskell"
+polled 1 fragment(s)
+#+end_example
+
+*The tests and benchmark do not need =just driver=* — they spawn their own
+throwaway driver against a scratch directory and tear it down afterwards. Only
+the demo and your own programs need a driver you start yourself.
+
+* Requirements
+
+Nix with flakes. Nothing else — the flake pins GHC 9.12.4, the Aeron C library
+(=aeron-cpp=), =aeronmd=, and every dev tool.
+
+#+begin_src shell
+nix develop --accept-flake-config    # or: direnv allow
+#+end_src
+
+=--accept-flake-config= lets the IOG binary cache serve a prebuilt GHC; without
+it the first shell entry compiles GHC from source.
+
+#+begin_quote
+*The reported Aeron version lies.* The Nix-packaged library prints
+=aeron version=1.44.1= no matter which version is actually linked (it is built
+without git metadata). Use =just aeron-info= or =ldd= to see the real store
+path. This is cosmetic, not an ABI mismatch.
+#+end_quote
+
+* Using the library
+
+The high-level module is =Aeron=. Lifetimes are bracketed (=withAeron=,
+=withPublication=, =withSubscription=, =withPoller=), so resources are always
+released, including on exception.
+
+** A minimal round trip
+
+#+begin_src haskell
+import Aeron
+
+main :: IO ()
+main =
+  withAeron defaultConfig $ \client ->
+    withPublication client "aeron:ipc" 1001 $ \pub ->
+      withSubscription client "aeron:ipc" 1001 $ \sub -> do
+        awaitConnected client 5 (publicationIsConnected pub)
+
+        _ <- offerByteString pub "hello"
+
+        withPoller sub handle $ \poller -> do
+          _ <- pollFragments poller 10
+          pure ()
+  where
+    handle frag = fragmentByteString frag >>= print
+#+end_src
+
+Set =aeronDir= in the config if your driver is not on the default directory:
+
+#+begin_src haskell
+withAeron defaultConfig { aeronDir = Just "/dev/shm/aeron-me" } $ \client -> ...
+#+end_src
+
+** Sending
+
+- =offer= / =offerByteString= — non-blocking publish. A negative result is a
+  =PublicationResult= sentinel; =BackPressured= and =NotConnected= are *normal
+  back-pressure, not errors* — retry or drop. Guard genuine failures with
+  =isPublicationError=.
+- =tryClaim= — zero-copy, allocation-free. Claims a region of the log buffer and
+  hands you a =Ptr Word8= to write into directly. The claim is committed when
+  your writer returns and aborted if it throws. This is the fastest way to
+  publish; messages must be under =pcMaxPayloadLength=.
+
+** Receiving
+
+=withPoller= binds a handler to a subscription; =pollFragments poller limit=
+polls up to =limit= fragments, calling the handler once per fragment before it
+returns.
+
+#+begin_quote
+*Fragments are zero-copy views, valid only until the next poll.* A =Fragment=
+is a =Ptr Word8= plus a length into Aeron's mapped log buffer — nothing is
+copied. If you need to keep the bytes past the handler, copy them out with
+=fragmentByteString= (which allocates, by design).
+#+end_quote
+
+Messages larger than the MTU arrive as several fragments. Use
+=withAssemblingPoller= instead of =withPoller= to have them reassembled into
+whole messages before your handler sees them.
+
+** Conductor threading
+
+=conductorMode= in the config chooses who runs the client's duty cycle:
+
+| Mode              | Who drives it                        | When to use                          |
+|-------------------+--------------------------------------+--------------------------------------|
+| =ConductorThread= | Aeron spawns and owns a thread       | Default. Simple; callbacks just work |
+| =AgentInvoker=    | *You* call =doWork= in your own loop | Latency budgets — you own your cores |
+
+Under =AgentInvoker= nothing progresses unless you call =doWork= regularly; it is
+the mode to pick when you cannot afford an Aeron-owned thread waking on a pinned
+core. The setup helpers (=withPublication=, =awaitConnected=) pump the conductor
+themselves, so both modes share one API.
+
+* Architecture
+
+Three layers, bottom to top:
+
+- =Aeron.FFI.Types= / =Aeron.FFI.Raw= — a 1:1 mirror of =aeronc.h= (via hsc2hs).
+  No marshalling. =safe= vs =unsafe= is chosen *per function*: non-blocking
+  hot-path calls are =unsafe=; anything that can block or re-enter Haskell is
+  =safe=.
+- =Aeron.FFI.Batch= + =cbits/aeron_shim.c= — the batched receive path (below).
+- =Aeron= / =Aeron.Error= — the idiomatic, bracketed interface above.
+
+** Why a C shim
+
+=aeron_subscription_poll= calls a handler once per fragment. If that handler is
+a Haskell closure, GHC forces the poll to be imported =safe= — an =unsafe=
+foreign call *may not re-enter Haskell* — and every fragment pays a C→Haskell
+trampoline. The shim (=cbits/aeron_shim.c=) is the handler instead: it records
+=(pointer, length, header)= descriptors into a caller-owned array and calls no
+Haskell at all. That makes the =unsafe= import *legal*, not merely faster.
+Payload stays zero-copy; only descriptors are written down.
+
+Full design and rationale: [[file:docs/m4-batched-poll.md][docs/m4-batched-poll.md]].
+
+** Threading contract
+
+Every client operation must run on the *bound thread* that =withAeron=
+establishes. Aeron reports errors through thread-local state, and an unbound
+Haskell thread can migrate between OS threads and read the wrong slot.
+=withAeron= runs its body via =runInBoundThread= to pin it. *Do not fork an
+unbound thread and poll from it.*
+
+Because of that bound thread, the executable, tests, and benchmark all build with
+=-threaded=.
+
+* Performance
+
+Poll-path microbenchmarks, IPC, back to back on one machine. The C shim replaced
+a =safe= call plus per-fragment FunPtr trampoline:
+
+| measurement        | safe + FunPtr |  unsafe + shim | change      |
+|--------------------+---------------+----------------+-------------|
+| empty poll         |  59.0 ns/call |   10.9 ns/call | 5.4× faster |
+| drain              | 229 ns/frag   |   69 ns/frag   | 3.3× faster |
+| drain throughput   | 4.36 M frag/s | 14.45 M frag/s | 3.3× more   |
+| round trip p50     |  772 ns       |  361 ns        | 2.1× faster |
+| round trip p99     |  93,211 ns    | 5,080 ns       | 18× lower   |
+| round trip p99.9   | 183,296 ns    | 7,495 ns       | 24× lower   |
+
+The *tail* is the real result. A =safe= call releases the RTS capability, letting
+the polling thread be descheduled mid-spin — the baseline p99 sat two orders of
+magnitude above its median. The =unsafe= import never yields, so a spin-poll loop
+stays hot. Reproduce with =just bench=.
+
+#+begin_quote
+Once the FFI overhead is gone, *GHC's GC pauses dominate tail latency*. This
+binding is allocation-free on the hot path (=tryClaim= + direct =poke=, zero-copy
+fragments), but that only pays off if your code above it is too.
+#+end_quote
+
+* Project layout
+
+#+begin_example
+├── flake.nix              Nix: haskell.nix + aeron-cpp + treefmt
+├── aeron-haskell.cabal
+├── justfile               all the commands above
+├── src/
+│   ├── Aeron.hs           idiomatic interface
+│   ├── Aeron/Error.hs     exceptions + the thread-local error hazard
+│   └── Aeron/FFI/
+│       ├── Types.hsc      opaque handles, structs, sentinels (hsc2hs)
+│       ├── Raw.hs         raw foreign imports
+│       └── Batch.hsc      batched-poll descriptors + unsafe poll imports
+├── cbits/
+│   ├── aeron_shim.h
+│   └── aeron_shim.c       the batching fragment collector
+├── app/Main.hs            the demo
+├── test/Main.hs           integration tests (spawn a real driver)
+├── bench/Main.hs          poll-path benchmark
+└── docs/m4-batched-poll.md  shim design + measured results
+#+end_example
+
+* All just recipes
+
+#+begin_src shell
+just              # list recipes
+just build        # build everything
+just driver       # run aeronmd in the foreground (leave running)
+just run          # run the demo (needs a driver)
+just test         # integration tests (self-driving)
+just bench        # poll-path benchmark (self-driving)
+just repl         # cabal repl on the library
+just fmt          # format (fourmolu + cabal-fmt + nixfmt + hlint)
+just fmt-check    # nix flake check
+just lint         # hlint
+just build-nix    # hermetic nix build -> ./result
+just aeron-info   # show the real linked libaeron path
+just clean        # remove build artifacts
+#+end_src
+
+* License
+
+MIT.
