@@ -53,11 +53,32 @@ nix develop --accept-flake-config    # or: direnv allow
 =--accept-flake-config= lets the IOG binary cache serve a prebuilt GHC; without
 it the first shell entry compiles GHC from source.
 
+* Aeron version
+
+| what                   | value                                       |
+|------------------------+---------------------------------------------|
+| Built & tested against | *Aeron C client 1.49.0* (=pkgs.aeron-cpp=)  |
+| Pinned by              | =flake.lock= (the nixpkgs input)            |
+| API targeted           | the stable C client API in =aeronc.h=       |
+
+The version is fixed by =flake.lock=, so every =nix develop= / =nix build= gets
+the exact same =aeron-cpp 1.49.0= — the 7 integration tests and all benchmarks in
+this repo ran against it. There is no system dependency to install or match; the
+media driver (=aeronmd=) comes from the same pinned package as the library it
+links, so driver and client can never disagree.
+
+The binding targets =aeronc.h=, which is stable across the Aeron 1.4x–1.5x line,
+so it should build against nearby versions unchanged — but 1.49.0 is the only one
+verified. To move versions, bump the nixpkgs input (=nix flake update=); nothing
+in the Haskell code names a version.
+
 #+begin_quote
-*The reported Aeron version lies.* The Nix-packaged library prints
-=aeron version=1.44.1= no matter which version is actually linked (it is built
-without git metadata). Use =just aeron-info= or =ldd= to see the real store
-path. This is cosmetic, not an ABI mismatch.
+*The reported Aeron version lies — do not trust it.* The Nix-packaged library
+prints =aeron version=1.44.1= at runtime no matter which version is actually
+linked (it is built without git metadata, so CMake falls back to a hardcoded
+string). This is cosmetic, not an ABI mismatch. To see the *real* version, read
+the store path — =just aeron-info=, or =ldd= on a built binary — which shows
+=…-aeron-cpp-1.49.0=.
 #+end_quote
 
 * Using the library
