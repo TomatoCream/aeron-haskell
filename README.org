@@ -156,7 +156,9 @@ trampoline. The shim (=cbits/aeron_shim.c=) is the handler instead: it records
 Haskell at all. That makes the =unsafe= import *legal*, not merely faster.
 Payload stays zero-copy; only descriptors are written down.
 
-Full design and rationale: [[file:docs/m4-batched-poll.md][docs/m4-batched-poll.md]].
+Full explanation of every optimization — mechanism, alternatives, and measured
+differences — is in [[file:docs/optimizations.org][docs/optimizations.org]]. The shim's design record is
+[[file:docs/m4-batched-poll.org][docs/m4-batched-poll.org]].
 
 ** Threading contract
 
@@ -216,7 +218,9 @@ fragments), but that only pays off if your code above it is too.
 ├── app/Main.hs            the demo
 ├── test/Main.hs           integration tests (spawn a real driver)
 ├── bench/Main.hs          poll-path benchmark
-└── docs/m4-batched-poll.md  shim design + measured results
+└── docs/
+    ├── optimizations.org      every perf decision, explained + measured
+    └── m4-batched-poll.org    the shim design record
 #+end_example
 
 * All just recipes

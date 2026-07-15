@@ -1,0 +1,325 @@
+#+TITLE: Optimizations in aeron-haskell
+#+SUBTITLE: what was done, why it is faster, and by how much
+#+OPTIONS: toc:2 num:t
+#+STARTUP: showall
+
+This document explains every performance decision in the binding: the mechanism,
+the cheaper alternative it beats, and the measured difference. The headline one —
+the batched C shim on the receive path — is worth reading in full, because the
+reason it wins is not the reason you would guess.
+
+All numbers are IPC, =aeronmd= 1.49.0, GHC 9.12.4 =-O2=, one machine, reproduced
+with =just bench=.
+
+* Background: what a foreign call costs in GHC
+
+Every optimization here follows from GHC's cost model for foreign calls, so it is
+worth stating up front.
+
+The Haskell runtime runs on a small number of *capabilities* (HECs) — each is an
+OS thread permitted to execute Haskell. Haskell green threads are multiplexed
+onto them by the RTS scheduler. A =foreign import= can be =unsafe= or =safe=, and
+they are wildly different:
+
+#+begin_src haskell
+foreign import ccall unsafe "..." c_fast :: ...   -- ~few ns
+foreign import ccall safe   "..." c_slow :: ...   -- ~100 ns+
+#+end_src
+
+| aspect                    | =unsafe=                          | =safe=                                  |
+|---------------------------+-----------------------------------+-----------------------------------------|
+| overhead                  | a few nanoseconds                 | ~100 ns and up                          |
+| holds the capability      | yes — no other Haskell runs on it | no — releases it, other threads proceed |
+| may block in C            | no — stalls the whole HEC         | yes — safe                              |
+| may call back into Haskell| *no — forbidden by GHC*           | yes                                     |
+
+An =unsafe= call is essentially inlined: the capability jumps into C and back with
+almost no bookkeeping. The price is that it must be a *leaf* — it may not block
+and it may not re-enter the RTS, because the RTS has no safe point recorded for
+it. A =safe= call sets up that safe point, releases the capability so the runtime
+keeps making progress, calls C, and reacquires — hence the cost.
+
+There is a third piece: =foreign import ccall "wrapper"= turns a Haskell closure
+into a C function pointer (via a stable pointer and an adjustor thunk). Invoking
+that pointer *from C* re-enters the RTS — which, by the table above, is only legal
+if the surrounding foreign call was imported =safe=.
+
+Hold onto that last sentence. It is the whole story of the receive path.
+
+* Optimization 1: batched receive through a C shim
+
+This is the big one. It is the difference between the binding being usable under a
+latency budget and not.
+
+** The obstacle
+
+=aeron_subscription_poll= is the core receive call. Its signature hands a callback
+to C:
+
+#+begin_src c
+int aeron_subscription_poll(
+    aeron_subscription_t *sub,
+    aeron_fragment_handler_t handler,  /* called once per fragment */
+    void *clientd,
+    size_t fragment_limit);
+#+end_src
+
+The obvious binding makes =handler= a Haskell closure wrapped as a =FunPtr=. But
+then, /during the poll/, C calls back into Haskell once per fragment. By the cost
+model that is only legal if =aeron_subscription_poll= is imported =safe=. So the
+obvious binding is forced into the two most expensive options at once, on the
+hottest path in the entire library:
+
+1. *A =safe= call on every poll* (~100 ns+, releases the capability).
+2. *A C→Haskell trampoline on every fragment* (the wrapper adjustor, per message).
+
+Crucially, =unsafe= here is not merely "faster but riskier" — it is *illegal*. A
+FunPtr handler and an =unsafe= poll cannot coexist. The design is boxed in.
+
+** The fix
+
+Put the fragment handler in C, where it belongs, and have it touch no Haskell at
+all. =cbits/aeron_shim.c= supplies a handler that just records a descriptor —
+=(pointer, length, header)= — per fragment into a caller-owned array:
+
+#+begin_src c
+typedef struct { const uint8_t *data; size_t length; aeron_header_t *header; }
+    ah_fragment_t;
+
+typedef struct { ah_fragment_t *fragments; size_t capacity; size_t count; }
+    ah_batch_t;
+
+/* The poll handler. clientd is an ah_batch_t*. Calls NO Haskell. */
+void ah_collect_fragment(void *clientd, const uint8_t *buffer,
+                         size_t length, aeron_header_t *header)
+{
+    ah_batch_t *b = (ah_batch_t *)clientd;
+    if (b->count >= b->capacity) return;          /* clamped; cannot overflow */
+    ah_fragment_t *f = &b->fragments[b->count++];
+    f->data = buffer; f->length = length; f->header = header;
+}
+
+/* One call: poll, collect, return the count. */
+int ah_poll_batch(aeron_subscription_t *sub, ah_batch_t *batch, size_t limit);
+#+end_src
+
+Now =ah_poll_batch= runs the entire poll — including every per-fragment callback —
+without a single instruction of Haskell executing. So it can be imported
+=unsafe=:
+
+#+begin_src haskell
+foreign import ccall unsafe "aeron_shim.h ah_poll_batch"
+  c_ah_poll_batch :: Ptr Subscription -> Ptr AhBatch -> CSize -> IO CInt
+#+end_src
+
+After the call returns, Haskell walks the descriptor array and invokes the user's
+handler per entry — as *ordinary Haskell code*, with no FFI boundary crossed per
+fragment at all.
+
+#+begin_quote
+*The shim buys soundness, not merely speed.* It is what makes the =unsafe= import
+legal in the first place. This is not a micro-optimization bolted onto a working
+design — it is the shape the C API actually wants. "Give me a buffer to fill" is
+how you cross the FFI boundary once per batch instead of once per element.
+#+end_quote
+
+** Before and after, as a cost tally
+
+#+begin_example
+FunPtr backend (per poll of N fragments):
+    1 × safe call        (~100 ns, releases capability, reacquires)
+  + N × C→Haskell adjustor trampoline
+
+Shim backend (per poll of N fragments):
+    1 × unsafe call      (~few ns, capability never released)
+  + N × Haskell struct peek + direct call   (no FFI boundary)
+#+end_example
+
+The FFI boundary is crossed *once per poll* instead of *1 + N times per poll*. The
+payload is never touched by either path — only descriptors move, so both are
+zero-copy in the bytes.
+
+** The results
+
+Two microbenchmarks isolate the two costs. =empty poll= polls an idle
+subscription, so it measures pure per-*call* overhead. =drain= times draining a
+pre-filled stream, so it measures per-*fragment* cost.
+
+| measurement      | M3: safe + FunPtr | M4: unsafe + shim | change      |
+|------------------+-------------------+-------------------+-------------|
+| empty poll       | 59.0 ns/call      | 10.9 ns/call      | 5.4× faster |
+| drain            | 229.3 ns/fragment | 69.2 ns/fragment  | 3.3× faster |
+| drain throughput | 4.36 M frag/s     | 14.45 M frag/s    | 3.3× more   |
+| round trip p50   | 772 ns            | 361 ns            | 2.1× faster |
+| round trip p99   | 93,211 ns         | 5,080 ns          | 18× lower   |
+| round trip p99.9 | 183,296 ns        | 7,495 ns          | 24× lower   |
+
+The mean improvements are what the design predicted. *The tail is the surprise,
+and it is the real result.*
+
+** Why the tail collapsed — the non-obvious part
+
+Look at the round-trip p99: the baseline was *93 microseconds*, two orders of
+magnitude above its own 772 ns median. That is not call overhead. That is the
+scheduler.
+
+A =safe= call *releases the capability*. In a spin-poll loop —
+=poll; poll; poll;= waiting for a reply — every poll therefore hands the RTS an
+opportunity to deschedule the polling thread and run something else on that HEC.
+Most of the time it does not, and you see the 772 ns median. But at the 99th
+percentile it does, and the reply sits unattended for tens of microseconds until
+the thread is rescheduled. The =safe= call didn't just cost 100 ns; it cost a
+context switch's worth of tail.
+
+An =unsafe= call *never yields*. The spin stays hot on its capability, so the
+reply is picked up the instant it lands. The p99 drops from ~90 µs to ~5 µs.
+
+#+begin_quote
+This inverts the usual argument for =unsafe=. People reach for =unsafe= to shave
+call overhead — "59 ns vs 11 ns, who cares" — and against a 772 ns round trip they
+are right not to care. *The overhead was never the point. Releasing the capability
+on every poll was.* For a latency-sensitive consumer, the row that matters in that
+table is p99, not p50.
+#+end_quote
+
+** What it cost to keep the API stable
+
+The public receive API did not change at all:
+
+#+begin_src haskell
+withPoller    :: Subscription -> (Fragment -> IO ()) -> (Poller -> IO a) -> IO a
+pollFragments :: Poller -> Int -> IO Int
+#+end_src
+
+A callback shape is satisfiable by *both* backends — the FunPtr one calls the
+handler from C, the shim one calls it from Haskell after the poll — so swapping
+the engine underneath was invisible to callers. This was a deliberate M2 decision:
+choose the API shape that leaves the fast path open. The proof that nothing moved
+is that all seven integration tests, including MTU-spanning reassembly, pass
+unchanged.
+
+The design record with the full rationale and invariants is
+[[file:m4-batched-poll.org][m4-batched-poll.org]].
+
+* Optimization 2: =safe= vs =unsafe= chosen per function
+
+The shim is one instance of a rule the whole =Aeron.FFI.Raw= module follows: the
+=safe=/=unsafe= choice is made *per function*, never globally.
+
+- *Hot-path, non-blocking, no callback* → =unsafe=. =offer=, =try_claim=, the
+  =is_connected= predicates, the batched poll. These are documented non-blocking
+  and never re-enter Haskell, so there is nothing to pay for.
+- *Can block, or re-enters Haskell* → =safe=. =aeron_init= (maps the CnC file),
+  =aeron_start= / =aeron_close= (join a thread), =aeron_main_do_work= (dispatches
+  Haskell callbacks). Importing any of these =unsafe= would stall or deadlock the
+  whole capability the moment they blocked.
+
+Getting this wrong in either direction is a real bug, not a style nit: =unsafe= on
+a blocking call freezes an HEC; =safe= on a hot call throws away the win above.
+
+* Optimization 3: zero-copy receive
+
+A =Fragment= is a view, not a copy:
+
+#+begin_src haskell
+data Fragment = Fragment
+  { fragmentData   :: !(Ptr Word8)     -- into Aeron's mapped log buffer
+  , fragmentLength :: !Int
+  , fragmentHeader :: !(Ptr AeronHeader)
+  }
+#+end_src
+
+The pointer aims straight into the memory-mapped term buffer the driver wrote. The
+tempting alternative — hand the user a =ByteString= — would =mallocForeignPtr= and
+=memcpy= the payload *on every single message*. No amount of poll-path cleverness
+can win that allocation back once it is baked into the type. Copying out is
+available (=fragmentByteString=) but it is the explicit, named opt-*out* of
+zero-copy, not the default.
+
+The cost of the view is a documented lifetime rule: the pointer is valid only
+until the next poll on that subscription. Because the handler runs inside
+=pollFragments=, that holds by construction.
+
+* Optimization 4: zero-copy send with =tryClaim=
+
+Symmetrically on the publish side, =tryClaim= claims a region of the log buffer and
+hands you a raw pointer to write *directly into the transport*:
+
+#+begin_src haskell
+tryClaim :: Publication -> Int -> (Ptr Word8 -> IO a) -> IO (Either PublicationResult a)
+#+end_src
+
+Your writer pokes bytes into the claim; it is committed when the writer returns,
+aborted if it throws. There is no staging buffer and no allocation. The
+alternative, =offer=, takes an existing buffer and lets Aeron copy it into the log
+— fine when you already have the bytes, but =tryClaim= removes even that copy for
+code that builds messages in place. It is the fastest publish path; the only limit
+is that a claim must be under =pcMaxPayloadLength= (one MTU).
+
+* Optimization 5: the batch buffer is allocated once
+
+=withPoller= allocates the descriptor array and the =ah_batch_t= exactly once, at
+setup, and every =pollFragments= reuses them:
+
+#+begin_src haskell
+data Poller = Poller
+  { pollerSub    :: !(Ptr Subscription)
+  , pollerHandler :: !(Fragment -> IO ())
+  , pollerBatch  :: !(Ptr AhBatch)       -- allocated once, reused every poll
+  , pollerFrags  :: !(Ptr AhFragment)    -- ditto
+  , pollerAssembler :: !(Maybe (Ptr FragmentAssembler))
+  }
+#+end_src
+
+Allocating the batch per poll would reintroduce exactly the per-call allocation
+the shim exists to remove — it would be self-defeating. The same reasoning applied
+to the old FunPtr: it was created once in =withPoller=, never per poll, because
+building a =FunPtr= allocates.
+
+* Optimization 6: end-to-end throughput
+
+Beyond latency, the sustained-throughput benchmark runs a publisher thread offering
+flat out while a separate subscriber thread drains, on separate clients and bound
+threads — how a throughput workload is really deployed. It exercises real
+cross-thread transport and the back-pressure the publisher feels when the
+subscriber falls behind, none of which the single-thread =drain= sees.
+
+At *20M × 1 KiB messages over IPC*: *~9 M msg/s, ~9.3 GB/s* (two runs 9.06 / 9.09,
+each 2.2 s).
+
+Two things worth knowing:
+
+- *Message size trades rate for bandwidth.* The same benchmark at 32-byte messages
+  runs ~15 M msg/s but only ~500 MB/s; at 1 KiB the rate falls to ~9 M msg/s but
+  bandwidth climbs to ~9 GB/s. Neither is "the" number — pick the size that
+  matches your traffic.
+- *Longer runs report higher, tighter numbers.* At 2M messages throughput bounced
+  between 5.7 and 6.7 M msg/s; at 20M it settles at a rock-steady ~9.1. The fixed
+  startup cost — connection handshake, first-touch page faults, priming the term
+  buffer — is a visible fraction of a 0.3 s run but a rounding error over 2.2 s.
+  The 20M figure is the honest steady-state one.
+
+* The honest limit: GC dominates the tail from here
+
+Once the FFI overhead is gone, *GHC's garbage collector sets the latency floor.*
+The binding is allocation-free on the hot path — =tryClaim= plus direct =poke= to
+send, zero-copy =Fragment= views to receive, reused batch buffers throughout — but
+that only pays off if the code /above/ it is too. A single per-message =ByteString=
+or =Maybe= in your handler hands the tail back to the collector, and no amount of
+shim removes a GC pause.
+
+This is why the design pushes so hard on zero-copy and zero-allocation: not for
+the nanoseconds directly, but so that the GC has nothing to collect on the hot
+path and its pauses never fire there. Under =AgentInvoker= conductor mode you also
+own the polling thread outright, so nothing Aeron-spawned wakes on a core you have
+pinned. The binding gets out of the way; keeping it out of the way is then yours.
+
+* Reproducing
+
+#+begin_src shell
+just bench
+#+end_src
+
+Prints all four measurements. The M3 column above is historical — that backend was
+replaced — but the M4 rows, the throughput figure, and the round-trip percentiles
+all regenerate from this command.

@@ -36,7 +36,7 @@ library
 
   -- The batching shim. It is what lets the poll be imported `unsafe`: GHC
   -- forbids an unsafe call from re-entering Haskell, so the fragment handler
-  -- has to be C. See docs/m4-batched-poll.md.
+  -- has to be C. See docs/optimizations.org.
   c-sources:        cbits/aeron_shim.c
   includes:         aeron_shim.h
   install-includes: aeron_shim.h
