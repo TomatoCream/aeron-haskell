@@ -26,12 +26,12 @@ foreign import ccall unsafe "..." c_fast :: ...   -- ~few ns
 foreign import ccall safe   "..." c_slow :: ...   -- ~100 ns+
 #+end_src
 
-| aspect                    | =unsafe=                          | =safe=                                  |
-|---------------------------+-----------------------------------+-----------------------------------------|
-| overhead                  | a few nanoseconds                 | ~100 ns and up                          |
-| holds the capability      | yes — no other Haskell runs on it | no — releases it, other threads proceed |
-| may block in C            | no — stalls the whole HEC         | yes — safe                              |
-| may call back into Haskell| *no — forbidden by GHC*           | yes                                     |
+| aspect                     | =unsafe=                            | =safe=                                    |
+|----------------------------+-----------------------------------+-----------------------------------------|
+| overhead                   | a few nanoseconds                 | ~100 ns and up                          |
+| holds the capability       | yes — no other Haskell runs on it | no — releases it, other threads proceed |
+| may block in C             | no — stalls the whole HEC         | yes — safe                              |
+| may call back into Haskell | *no — forbidden by GHC*             | yes                                     |
 
 An =unsafe= call is essentially inlined: the capability jumps into C and back with
 almost no bookkeeping. The price is that it must be a *leaf* — it may not block
@@ -323,3 +323,123 @@ just bench
 Prints all four measurements. The M3 column above is historical — that backend was
 replaced — but the M4 rows, the throughput figure, and the round-trip percentiles
 all regenerate from this command.
+
+* Appendix: the original FunPtr design, in full
+
+The =safe= + FunPtr receive path (the "M3" column throughout) was the first
+design, and it is instructive precisely because it is the /obvious/ one — the
+binding you would write first, that works, and that is quietly slow. The code
+below is the real thing, recovered from git (commit =68081c0=, the last state
+before the shim). Reading it next to the current version shows exactly where the
+cost hid.
+
+** The import — forced =safe=
+
+#+begin_src haskell
+-- ORIGINAL (M3): the fragment handler is a Haskell FunPtr, so C re-enters the
+-- RTS once per fragment. GHC only permits that under a `safe` import.
+foreign import ccall safe "aeron/aeronc.h aeron_subscription_poll"
+  c_aeron_subscription_poll ::
+    Ptr Subscription ->
+    FunPtr FragmentHandlerC ->   -- ← a wrapped Haskell closure
+    Ptr () ->
+    CSize ->
+    IO CInt
+
+foreign import ccall "wrapper"
+  mkFragmentHandler :: FragmentHandlerC -> IO (FunPtr FragmentHandlerC)
+#+end_src
+
+The =safe= here is not a preference — it is *mandatory*. A =FunPtr= handler that
+Aeron calls during the poll means C re-enters Haskell, and by the cost model
+(section 1) an =unsafe= call may not do that. The FunPtr backend and =unsafe= are
+mutually exclusive. This is the constraint the whole optimization is built to
+escape.
+
+** The Haskell — one deceptively cheap line
+
+#+begin_src haskell
+-- ORIGINAL (M3)
+data Poller = Poller
+  { pollerSub     :: !(Ptr Subscription)
+  , pollerFun     :: !(FunPtr FragmentHandlerC)   -- a wrapped Haskell closure
+  , pollerClientd :: !(Ptr ())
+  }
+
+withPoller :: Subscription -> (Fragment -> IO ()) -> (Poller -> IO a) -> IO a
+withPoller (Subscription sub) handler act =
+  -- The FunPtr is built ONCE here (creating one allocates), freed on exit.
+  bracket (mkFragmentHandler (fragmentTrampoline handler)) freeHaskellFunPtr $ \fp ->
+    act (Poller {pollerSub = sub, pollerFun = fp, pollerClientd = nullPtr})
+
+fragmentTrampoline :: (Fragment -> IO ()) -> FragmentHandlerC
+fragmentTrampoline handler _clientd buf len hdr =        -- ← runs once PER FRAGMENT,
+  handler                                                --   re-entered from C
+    Fragment {fragmentData = buf, fragmentLength = fromIntegral len, fragmentHeader = hdr}
+
+pollFragments :: Poller -> Int -> IO Int
+pollFragments Poller {pollerSub, pollerFun, pollerClientd} fragmentLimit =
+  fromIntegral
+    <$> checkNeg
+      "aeron_subscription_poll"
+      (c_aeron_subscription_poll pollerSub pollerFun pollerClientd  -- ← ONE safe call…
+         (fromIntegral fragmentLimit))                              --   …that fans out to N
+#+end_src
+
+=pollFragments= is a single expression — which is exactly what disguises its cost.
+For a poll that returns *N* fragments, this one line triggers:
+
+1. *One =safe= call.* ~100 ns, and — the expensive part — it *releases the
+   capability*, handing the scheduler a chance to deschedule this thread on every
+   single poll.
+2. *N invocations of =pollerFun= inside C.* Each is a C→Haskell adjustor
+   trampoline: re-enter the RTS, run =fragmentTrampoline=, return to C.
+
+So the FFI boundary is crossed *1 + N times per poll*, and the poll itself is a
+yield point. Nothing is wrong with the code — it is correct and readable. It is
+slow structurally, not through any mistake, and that is the point: the slowness is
+in the /shape/, not the lines.
+
+** Side by side with the shim backend
+
+#+begin_src haskell
+-- ORIGINAL (M3): one safe call, N C→Haskell trampolines
+pollFragments Poller{pollerSub, pollerFun, pollerClientd} lim =
+  fromIntegral <$> checkNeg "aeron_subscription_poll"
+    (c_aeron_subscription_poll pollerSub pollerFun pollerClientd (fromIntegral lim))
+
+-- NEW (M4): one unsafe call, then walk the descriptor array in pure Haskell
+pollFragments Poller{pollerSub, pollerHandler, pollerBatch, pollerFrags, pollerAssembler} lim = do
+  n <- checkNeg "ah_poll_batch" $ case pollerAssembler of
+         Nothing  -> c_ah_poll_batch          pollerSub     pollerBatch (fromIntegral lim)
+         Just asm -> c_ah_poll_batch_assembled pollerSub asm pollerBatch (fromIntegral lim)
+  let count = fromIntegral n
+  dispatch 0 count                -- ← no FFI boundary in this loop
+  pure count
+ where
+  dispatch !i !n
+    | i >= n    = pure ()
+    | otherwise = do
+        AhFragment{ahData, ahLength, ahHeader} <- peekElemOff pollerFrags i
+        pollerHandler Fragment{ fragmentData = ahData
+                              , fragmentLength = fromIntegral ahLength
+                              , fragmentHeader = ahHeader }
+        dispatch (i + 1) n
+#+end_src
+
+| aspect                | M3: =safe= + FunPtr                  | M4: =unsafe= + shim              |
+|-----------------------+--------------------------------------+----------------------------------|
+| poll call             | =safe= (~100 ns, releases capability) | =unsafe= (~few ns, never yields) |
+| handler is            | Haskell closure wrapped as =FunPtr=  | plain =Fragment -> IO ()=        |
+| per-fragment crossing | C→Haskell adjustor trampoline        | a =peek= + call, no FFI          |
+| FFI crossings / poll  | *1 + N*                              | *1*                              |
+| =unsafe= possible?    | *no — illegal* with a FunPtr handler | yes                              |
+
+The two data types tell the same story at a glance: M3's =Poller= carries a
+=FunPtr= (the boundary lives /in/ the poller); M4's carries a plain
+=Fragment -> IO ()= and a pre-allocated batch buffer (the boundary is gone, and
+nothing allocates per poll).
+
+The public API — =withPoller= and =pollFragments='s signatures — is byte-for-byte
+identical between the two. That is what let the engine be swapped with no caller
+change and all seven tests passing untouched.
