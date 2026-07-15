@@ -123,7 +123,7 @@ throughputMsgs :: Int
 throughputMsgs = 2_000_000
 
 throughputMsgSize :: Int
-throughputMsgSize = 32
+throughputMsgSize = 1024
 
 {- | Sustained end-to-end throughput: a publisher thread offers flat out while a
 separate subscriber thread drains, timed from the first offer to the last
